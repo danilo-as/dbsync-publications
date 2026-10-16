@@ -43,7 +43,8 @@ It then validates every target, shows a plan per target and asks for confirmatio
 | Table | Strategy |
 |---|---|
 | Publication schema, has `version_id` | Upsert the selected `publication_versions` rows, `DELETE ... WHERE version_id = ANY(...)`, then `COPY` only those versions. |
-| Publication schema, no `version_id` (or schema without `publication_versions`) | `TRUNCATE` + `COPY` of the whole table. Flagged with ⚠ in the table list and in the plan. |
+| Publication schema, no `version_id` | `TRUNCATE` + `COPY` of the whole table. Flagged with ⚠ in the table list and in the plan. |
+| Publication schema without `publication_versions`, table has `version_id` | Skipped with a message. It is never truncated, because that would delete every version on the target. |
 | Other schemas | `COPY` into a temporary staging table, then `INSERT ... ON CONFLICT DO NOTHING`: only new rows are added, existing rows are never updated. |
 
 Each target is loaded in **one transaction**: if anything fails, that target is rolled back

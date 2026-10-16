@@ -42,11 +42,25 @@ def test_split_schemas_uses_publications_suffix():
 
 
 def test_strategy_selection():
-    assert strategy_for(VERSIONED, publication_mode=True, versions_available=True) is Strategy.VERSION_REPLACE
-    assert strategy_for(NO_VERSION, publication_mode=True, versions_available=True) is Strategy.TRUNCATE_REPLACE
-    # Publication schema without publication_versions cannot filter by version.
-    assert strategy_for(VERSIONED, publication_mode=True, versions_available=False) is Strategy.TRUNCATE_REPLACE
-    assert strategy_for(VERSIONED, publication_mode=False, versions_available=False) is Strategy.INSERT_NEW
+    assert strategy_for(VERSIONED, publication_mode=True) is Strategy.VERSION_REPLACE
+    assert strategy_for(NO_VERSION, publication_mode=True) is Strategy.TRUNCATE_REPLACE
+    assert strategy_for(VERSIONED, publication_mode=False) is Strategy.INSERT_NEW
+
+
+def test_version_table_without_versions_is_skipped_never_truncated():
+    # Schema without publication_versions (or no versions selected): source_pv is None.
+    plans = plan_target(
+        tables=[VERSIONED, NO_VERSION],
+        strategies={"prices": Strategy.VERSION_REPLACE, "system_pricing": Strategy.TRUNCATE_REPLACE},
+        target_catalog={"prices": VERSIONED, "system_pricing": NO_VERSION},
+        source_pv=None,
+    )
+    by_name = {p.table.name: p for p in plans}
+    assert not by_name["prices"].ready
+    assert by_name["prices"].messages == [
+        "has version_id but no publication versions to filter by: skipped (never truncated)"
+    ]
+    assert by_name["system_pricing"].ready
 
 
 def test_compare_tables_reports_type_nullability_and_missing_columns():

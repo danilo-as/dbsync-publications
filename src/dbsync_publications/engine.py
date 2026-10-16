@@ -44,14 +44,11 @@ def build_plan(
     publication_mode: bool,
 ) -> SyncPlan:
     source_catalog = catalog.load_tables(source, schema)
-    versions_table = source_catalog.get(VERSIONS_TABLE) if publication_mode else None
-    versions_available = versions_table is not None and bool(version_ids)
+    # Without selected versions there is nothing to filter by: version tables get skipped.
+    versions_table = source_catalog.get(VERSIONS_TABLE) if publication_mode and version_ids else None
 
     tables = [source_catalog[name] for name in table_names if name != VERSIONS_TABLE]
-    strategies = {
-        t.name: strategy_for(t, publication_mode=publication_mode, versions_available=versions_available)
-        for t in tables
-    }
+    strategies = {t.name: strategy_for(t, publication_mode=publication_mode) for t in tables}
     plans = {
         name: plan_target(tables, strategies, catalog.load_tables(conn, schema), versions_table)
         for name, conn in targets.items()

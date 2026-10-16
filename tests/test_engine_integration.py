@@ -129,6 +129,26 @@ def test_other_schema_inserts_only_new_rows(databases):
     assert _rows(t1, "SELECT id, name FROM locations.regions ORDER BY id") == [(1, "Norte"), (2, "South")]
 
 
+def test_version_table_is_never_truncated_without_versions(databases):
+    source, targets = databases
+    t1 = targets["target_1"]
+    t1.execute(f"""
+        INSERT INTO locations.regions VALUES (1, 'North'), (2, 'South');
+        INSERT INTO demo_publications.publication_versions VALUES ('{V1}', 2026, 2, 1, true);
+        INSERT INTO demo_publications.prices (version_id, value) VALUES ('{V1}', 99);
+    """)
+
+    plan = build_plan(
+        source, {"target_1": t1}, schema="demo_publications",
+        table_names=["prices", "system_pricing"], version_ids=[], publication_mode=True,
+    )
+    results = execute_plan(source, {"target_1": t1}, plan)
+
+    assert results[0].ok
+    assert results[0].tables == {"system_pricing": 2}
+    assert _rows(t1, "SELECT value FROM demo_publications.prices") == [(99,)]
+
+
 def test_failure_rolls_back_whole_target(databases):
     source, targets = databases
     t1 = targets["target_1"]

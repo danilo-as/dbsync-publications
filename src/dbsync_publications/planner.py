@@ -16,10 +16,13 @@ def split_schemas(schemas: Iterable[str]) -> tuple[list[str], list[str]]:
     return pubs, others
 
 
-def strategy_for(table: TableInfo, *, publication_mode: bool, versions_available: bool) -> Strategy:
+NO_VERSIONS_MESSAGE = "has version_id but no publication versions to filter by: skipped (never truncated)"
+
+
+def strategy_for(table: TableInfo, *, publication_mode: bool) -> Strategy:
     if not publication_mode:
         return Strategy.INSERT_NEW
-    if table.has_version_id and versions_available:
+    if table.has_version_id:
         return Strategy.VERSION_REPLACE
     return Strategy.TRUNCATE_REPLACE
 
@@ -43,7 +46,12 @@ def plan_target(
     target_catalog: dict[str, TableInfo],
     source_pv: TableInfo | None,
 ) -> list[TablePlan]:
-    """Decide, for one target, which selected tables are ready to sync."""
+    """Decide, for one target, which selected tables are ready to sync.
+
+    ``source_pv`` is None when there are no publication versions to filter by
+    (schema without publication_versions or no versions selected); version
+    tables are then skipped instead of truncated.
+    """
     pv_problem: str | None = None
     if source_pv is not None and any(s is Strategy.VERSION_REPLACE for s in strategies.values()):
         pv_diffs = compare_tables(source_pv, target_catalog.get(VERSIONS_TABLE))
@@ -57,7 +65,10 @@ def plan_target(
         plan = TablePlan(table=table, strategy=strategy)
         diffs = compare_tables(table, target)
 
-        if diffs:
+        if strategy is Strategy.VERSION_REPLACE and source_pv is None:
+            plan.ready = False
+            plan.messages.append(NO_VERSIONS_MESSAGE)
+        elif diffs:
             plan.ready = False
             plan.messages.extend(diffs)
         elif strategy is Strategy.VERSION_REPLACE and pv_problem:

@@ -50,7 +50,8 @@ def choose_versions(source: psycopg.Connection, schema: str, tables: dict) -> li
     pv = tables.get(VERSIONS_TABLE)
     if pv is None:
         console.print(
-            f"[yellow]⚠ {schema} has no {VERSIONS_TABLE} table: every table will be TRUNCATEd and fully reloaded.[/yellow]"
+            f"[yellow]⚠ {schema} has no {VERSIONS_TABLE} table: tables without version_id will be "
+            f"TRUNCATEd and fully reloaded; tables with version_id will be skipped.[/yellow]"
         )
         return []
     rows = catalog.list_versions(source, pv)
@@ -72,10 +73,12 @@ def choose_tables(tables: dict, publication_mode: bool, versions_available: bool
     for name, table in sorted(tables.items()):
         if name == VERSIONS_TABLE:
             continue
-        strategy = strategy_for(table, publication_mode=publication_mode, versions_available=versions_available)
+        strategy = strategy_for(table, publication_mode=publication_mode)
         notices = table_notices(table, strategy)
         title = name
-        if strategy is Strategy.TRUNCATE_REPLACE:
+        if strategy is Strategy.VERSION_REPLACE and not versions_available:
+            title = f"⚠ {name}  (has version_id but no publication_versions → will be skipped)"
+        elif strategy is Strategy.TRUNCATE_REPLACE:
             title = f"⚠ {name}  (no version_id → TRUNCATE + full reload)"
         elif notices:
             title = f"⚠ {name}  ({notices[0]})"
