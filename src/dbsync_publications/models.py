@@ -24,6 +24,8 @@ class ForeignKey:
     name: str
     table: str  # qualified referencing table, e.g. "schema.child"
     referenced: str  # qualified referenced table, e.g. "schema.parent"
+    columns: tuple[str, ...] = ()  # referencing columns on the child, in key order
+    referenced_columns: tuple[str, ...] = ()  # matching key columns on the parent
 
 
 @dataclass(frozen=True)
@@ -64,9 +66,30 @@ class Strategy(Enum):
     INSERT_NEW = "COPY to staging + INSERT ON CONFLICT DO NOTHING"
 
 
+@dataclass(frozen=True)
+class ParentEdge:
+    """A foreign key from ``child`` (a synced table or another parent) to a parent table."""
+
+    child: str  # qualified referencing table
+    fk: ForeignKey
+
+
+@dataclass
+class ParentFill:
+    """An unselected table whose referenced rows are copied with ON CONFLICT DO NOTHING."""
+
+    table: TableInfo
+    edges: list[ParentEdge] = field(default_factory=list)
+
+    @property
+    def self_referencing(self) -> bool:
+        return any(fk.referenced == self.table.qualified for fk in self.table.outgoing_fks)
+
+
 @dataclass
 class TablePlan:
     table: TableInfo
     strategy: Strategy
     ready: bool = True
     messages: list[str] = field(default_factory=list)
+    parents: tuple[str, ...] = ()  # qualified parent tables filled for this table, parents first

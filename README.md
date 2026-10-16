@@ -61,8 +61,13 @@ selected tables.
   skipped for that target.
 - `TRUNCATE` never uses `CASCADE`. A table referenced by a foreign key from another table is
   skipped with a message.
-- Tables with outgoing foreign keys show a warning naming the parent table that must already
-  contain the referenced rows on the target.
+- Missing parent rows are copied automatically. For every foreign key from a selected table to
+  an unselected table (any schema, followed recursively to parents of parents), only the parent
+  rows referenced by the synced rows are exported from the source and inserted, parents first,
+  with `INSERT ... ON CONFLICT DO NOTHING`. Existing parent rows are never updated or deleted.
+  The plan lists every parent table that will be filled. A parent table that references itself
+  is copied whole (still insert only). If a parent table differs in the target, or does not
+  exist there, the selected table that needs it is skipped with a message.
 - In other schemas, tables without a primary key or unique constraint show a warning:
   `ON CONFLICT` cannot detect duplicates there, so every row would be inserted again.
 - Temporary CSV files live in a temporary directory that is removed at the end of the run,

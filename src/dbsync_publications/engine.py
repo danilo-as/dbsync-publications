@@ -10,8 +10,8 @@ import psycopg
 from psycopg import sql
 
 from . import catalog
-from .models import VERSION_COLUMN, VERSIONS_TABLE, Strategy, TableInfo, TablePlan
-from .planner import plan_target, strategy_for, topo_order
+from .models import VERSION_COLUMN, VERSIONS_TABLE, ParentFill, Strategy, TableInfo, TablePlan
+from .planner import parent_closure, plan_target, strategy_for, topo_order
 
 CHUNK_SIZE = 1024 * 1024
 
@@ -24,6 +24,7 @@ class SyncPlan:
     source_tables: dict[str, TableInfo]
     versions_table: TableInfo | None
     targets: dict[str, list[TablePlan]]
+    parents: dict[str, ParentFill] = field(default_factory=dict)
 
 
 @dataclass
@@ -32,6 +33,23 @@ class TargetResult:
     ok: bool
     error: str | None = None
     tables: dict[str, int] = field(default_factory=dict)
+
+
+class _CatalogCache:
+    """Resolve qualified table names, loading each schema's catalog once."""
+
+    def __init__(self, conn: psycopg.Connection, preloaded: dict[str, dict[str, TableInfo]] | None = None):
+        self._conn = conn
+        self._schemas = dict(preloaded or {})
+
+    def schema(self, name: str) -> dict[str, TableInfo]:
+        if name not in self._schemas:
+            self._schemas[name] = catalog.load_tables(self._conn, name)
+        return self._schemas[name]
+
+    def table(self, qualified: str) -> TableInfo | None:
+        schema, _, name = qualified.partition(".")
+        return self.schema(schema).get(name)
 
 
 def build_plan(
@@ -49,11 +67,25 @@ def build_plan(
 
     tables = [source_catalog[name] for name in table_names if name != VERSIONS_TABLE]
     strategies = {t.name: strategy_for(t, publication_mode=publication_mode) for t in tables}
-    plans = {
-        name: plan_target(tables, strategies, catalog.load_tables(conn, schema), versions_table)
-        for name, conn in targets.items()
-    }
-    return SyncPlan(schema, publication_mode, list(version_ids), source_catalog, versions_table, plans)
+    # Selected publication_versions rows are upserted separately, so they are never parent fills.
+    upserted = [versions_table.qualified] if versions_table is not None else []
+    source_cache = _CatalogCache(source, {schema: source_catalog})
+    parents, deps, missing = parent_closure(tables, source_cache.table, upserted)
+
+    plans = {}
+    for name, conn in targets.items():
+        target_cache = _CatalogCache(conn)
+        plans[name] = plan_target(
+            tables,
+            strategies,
+            target_cache.schema(schema),
+            versions_table,
+            parents=parents,
+            parent_deps=deps,
+            target_parents={parent: target_cache.table(parent) for parent in parents},
+            missing_parents=missing,
+        )
+    return SyncPlan(schema, publication_mode, list(version_ids), source_catalog, versions_table, plans, parents)
 
 
 def execute_plan(
@@ -71,10 +103,16 @@ def execute_plan(
         tmp_dir = Path(tmp)
         files: dict[str, Path] = {}
         exported: dict[str, int] = {}
+        filters: dict[str, sql.Composed | None] = {}
         for name, table in ready_tables.items():
             strategy = next(p.strategy for plans in plan.targets.values() for p in plans if p.table.name == name)
             where = _version_filter(table, plan.version_ids) if strategy is Strategy.VERSION_REPLACE else None
+            filters[table.qualified] = where
             files[name], exported[name] = _export(source, table, where, tmp_dir)
+        needed = {parent for plans in plan.targets.values() for p in plans if p.ready for parent in p.parents}
+        parent_filter = _ParentFilter(plan.parents, filters, needed)
+        for parent in sorted(needed):
+            files[parent], _ = _export(source, plan.parents[parent].table, parent_filter.of(parent), tmp_dir)
         if needs_versions and plan.versions_table is not None:
             pv = plan.versions_table
             files[VERSIONS_TABLE], _ = _export(source, pv, _id_filter(pv, plan.version_ids), tmp_dir)
@@ -118,6 +156,62 @@ def _id_filter(pv: TableInfo, version_ids: list[str]) -> sql.Composed:
     return sql.SQL("{} = ANY({})").format(sql.Identifier("id"), _array_of(version_ids, id_type))
 
 
+class _ParentFilter:
+    """Build the WHERE clause that selects only the parent rows the synced rows reference.
+
+    A parent row is needed when an exported child row (a synced table, or another
+    needed parent) points at it. Self-referencing parents are copied whole, because
+    their own ancestors would otherwise be missing.
+    """
+
+    def __init__(
+        self,
+        parents: dict[str, ParentFill],
+        child_filters: dict[str, sql.Composed | None],
+        needed: set[str],
+    ):
+        self._parents = parents
+        self._child_filters = child_filters
+        self._needed = needed
+        self._memo: dict[str, sql.Composable | None] = {}
+
+    def of(self, name: str, path: frozenset[str] = frozenset()) -> sql.Composable | None:
+        if name in self._memo:
+            return self._memo[name]
+        fill = self._parents[name]
+        if fill.self_referencing:
+            return None
+        parts: list[sql.Composable] = []
+        for edge in fill.edges:
+            child = edge.child
+            if child in path:  # cycle between parent tables
+                continue
+            if child in self._child_filters:
+                where = self._child_filters[child]
+            elif child in self._needed:
+                where = self.of(child, path | {name})
+            else:
+                continue
+            subquery = sql.SQL("SELECT {} FROM {}").format(
+                sql.SQL(", ").join(sql.Identifier(c) for c in edge.fk.columns), _qualified_name(child)
+            )
+            if where is not None:
+                subquery += sql.SQL(" WHERE ") + where
+            parts.append(
+                sql.SQL("({}) IN ({})").format(
+                    sql.SQL(", ").join(sql.Identifier(c) for c in edge.fk.referenced_columns), subquery
+                )
+            )
+        result = sql.SQL(" OR ").join(parts) if parts else sql.SQL("FALSE")
+        self._memo[name] = result
+        return result
+
+
+def _qualified_name(qualified: str) -> sql.Composed:
+    schema, _, name = qualified.partition(".")
+    return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(name))
+
+
 def _export(source: psycopg.Connection, table: TableInfo, where: sql.Composed | None, tmp_dir: Path) -> tuple[Path, int]:
     path = tmp_dir / f"{table.schema}.{table.name}.csv"
     select = sql.SQL("SELECT {} FROM {}").format(_column_list(table), _qualified(table))
@@ -139,7 +233,7 @@ def _copy_in(cur: psycopg.Cursor, target: sql.Composable, columns: sql.Composabl
             copy.write(chunk)
 
 
-def _copy_via_staging(cur: psycopg.Cursor, table: TableInfo, path: Path, index: int) -> sql.Identifier:
+def _copy_via_staging(cur: psycopg.Cursor, table: TableInfo, path: Path, index: int | str) -> sql.Identifier:
     staging = sql.Identifier(f"_dbsync_stg_{index}")
     cur.execute(
         sql.SQL("CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DROP").format(staging, _qualified(table))
@@ -183,6 +277,14 @@ def _load_target(
     with conn.transaction(), conn.cursor() as cur:
         if Strategy.VERSION_REPLACE in strategies.values() and plan.versions_table is not None:
             _upsert_versions(cur, plan.versions_table, files[VERSIONS_TABLE])
+
+        # Missing parent rows of unselected tables: insert only, never update or delete.
+        needed = {parent for p in ready for parent in p.parents}
+        parent_tables = topo_order([plan.parents[name].table for name in needed])
+        for index, parent in enumerate(parent_tables):
+            staging = _copy_via_staging(cur, parent, files[parent.qualified], f"p{index}")
+            cur.execute(_insert_from(parent, staging) + sql.SQL(" ON CONFLICT DO NOTHING"))
+            counts[f"{parent.qualified} (parent rows)"] = cur.rowcount
 
         # Children first so deletes/truncates never trip a FK between selected tables.
         for table in reversed(ordered):

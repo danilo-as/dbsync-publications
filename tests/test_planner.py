@@ -1,5 +1,6 @@
 from dbsync_publications.models import Column, ForeignKey, Strategy, TableInfo
 from dbsync_publications.planner import (
+    parent_closure,
     plan_target,
     split_schemas,
     strategy_for,
@@ -26,8 +27,8 @@ def table(name, columns, schema=SCHEMA, pk=("id",), unique=True, incoming=(), ou
     )
 
 
-def fk(name, table, referenced):
-    return ForeignKey(name=name, table=table, referenced=referenced)
+def fk(name, table, referenced, columns=(), referenced_columns=()):
+    return ForeignKey(name, table, referenced, tuple(columns), tuple(referenced_columns))
 
 
 PV = table("publication_versions", [col("id", "uuid", True), col("publication_year", "integer", True)])
@@ -110,15 +111,87 @@ def test_truncate_table_has_notice_and_incoming_fk_blocks_it():
     assert any("fk_child" in m and "CASCADE" in m for m in blocked[0].messages)
 
 
-def test_outgoing_fk_warns_about_parent_table():
-    child = table(
-        "system_pricing",
-        NO_VERSION.columns,
-        outgoing=[fk("fk_region", f"{SCHEMA}.system_pricing", "locations.regions")],
+COUNTRIES = table("countries", [col("id", "integer", True)], schema="locations")
+REGIONS = table(
+    "regions",
+    [col("id", "integer", True), col("country_id", "integer")],
+    schema="locations",
+    outgoing=[fk("fk_country", "locations.regions", "locations.countries", ["country_id"], ["id"])],
+)
+PRICED = table(
+    "system_pricing",
+    [*NO_VERSION.columns, col("region_id", "integer")],
+    outgoing=[fk("fk_region", f"{SCHEMA}.system_pricing", "locations.regions", ["region_id"], ["id"])],
+)
+SOURCE_PARENTS = {t.qualified: t for t in (COUNTRIES, REGIONS)}
+
+
+def _plan_with_parents(target_parents):
+    parents, deps, missing = parent_closure([PRICED], SOURCE_PARENTS.get)
+    return plan_target(
+        [PRICED],
+        {"system_pricing": Strategy.TRUNCATE_REPLACE},
+        {"system_pricing": PRICED},
+        None,
+        parents=parents,
+        parent_deps=deps,
+        target_parents=target_parents,
+        missing_parents=missing,
+    )[0]
+
+
+def test_parent_closure_follows_parents_of_parents_in_order():
+    parents, deps, missing = parent_closure([PRICED], SOURCE_PARENTS.get)
+    assert deps == {"system_pricing": ("locations.countries", "locations.regions")}
+    assert [e.child for e in parents["locations.regions"].edges] == [PRICED.qualified]
+    assert [e.child for e in parents["locations.countries"].edges] == ["locations.regions"]
+    assert missing == {}
+
+
+def test_parent_closure_skips_selected_excluded_and_self_references():
+    tree = table(
+        "regions",
+        REGIONS.columns,
+        schema="locations",
+        outgoing=[fk("fk_parent", "locations.regions", "locations.regions", ["country_id"], ["id"])],
     )
-    plans = plan_target([child], {"system_pricing": Strategy.TRUNCATE_REPLACE}, {"system_pricing": child}, None)
-    assert plans[0].ready
-    assert any("locations.regions" in m for m in plans[0].messages)
+    child = table(
+        "prices",
+        VERSIONED.columns,
+        outgoing=[
+            fk("fk_version", f"{SCHEMA}.prices", f"{SCHEMA}.publication_versions", ["version_id"], ["id"]),
+            fk("fk_sibling", f"{SCHEMA}.prices", PRICED.qualified, ["id"], ["id"]),
+            fk("fk_region", f"{SCHEMA}.prices", "locations.regions", ["value"], ["id"]),
+        ],
+    )
+    parents, deps, _ = parent_closure(
+        [child, PRICED], {"locations.regions": tree}.get, exclude=[f"{SCHEMA}.publication_versions"]
+    )
+    assert deps["prices"] == ("locations.regions",)
+    assert parents["locations.regions"].self_referencing
+
+
+def test_parent_closure_reports_parent_missing_in_source():
+    _, _, missing = parent_closure([PRICED], {}.get)
+    assert missing == {"system_pricing": "locations.regions"}
+
+
+def test_missing_parent_rows_are_planned_instead_of_warned():
+    plan = _plan_with_parents(SOURCE_PARENTS)
+    assert plan.ready
+    assert plan.parents == ("locations.countries", "locations.regions")
+    assert "missing parent rows in locations.regions are copied from source (ON CONFLICT DO NOTHING)" in plan.messages
+    assert not any("requires parent rows" in m for m in plan.messages)
+
+
+def test_parent_table_differing_in_target_skips_child():
+    bad_regions = table("regions", [col("id", "integer", True)], schema="locations")
+    plan = _plan_with_parents({"locations.countries": COUNTRIES, "locations.regions": bad_regions})
+    assert not plan.ready
+    assert plan.parents == ()
+    assert any(m.startswith("parent table locations.regions differs in target") for m in plan.messages)
+    missing = _plan_with_parents({"locations.regions": REGIONS, "locations.countries": None})
+    assert "parent table locations.countries differs in target (table does not exist in target)" in missing.messages
 
 
 def test_publication_versions_mismatch_skips_version_tables_only():

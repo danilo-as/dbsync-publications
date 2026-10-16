@@ -63,9 +63,15 @@ def load_tables(conn: psycopg.Connection, schema: str) -> dict[str, TableInfo]:
 
     incoming: dict[str, list[ForeignKey]] = defaultdict(list)
     outgoing: dict[str, list[ForeignKey]] = defaultdict(list)
-    for conname, child_schema, child, parent_schema, parent in conn.execute(
+    for conname, child_schema, child, parent_schema, parent, child_cols, parent_cols in conn.execute(
         """
-        SELECT con.conname, cn.nspname, cc.relname, pn.nspname, pc.relname
+        SELECT con.conname, cn.nspname, cc.relname, pn.nspname, pc.relname,
+               array(SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY k(attnum, ord)
+                     JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+                     ORDER BY k.ord),
+               array(SELECT a.attname FROM unnest(con.confkey) WITH ORDINALITY k(attnum, ord)
+                     JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+                     ORDER BY k.ord)
         FROM pg_constraint con
         JOIN pg_class cc ON cc.oid = con.conrelid
         JOIN pg_namespace cn ON cn.oid = cc.relnamespace
@@ -75,7 +81,9 @@ def load_tables(conn: psycopg.Connection, schema: str) -> dict[str, TableInfo]:
         """,
         (schema, schema),
     ):
-        fk = ForeignKey(conname, f"{child_schema}.{child}", f"{parent_schema}.{parent}")
+        fk = ForeignKey(
+            conname, f"{child_schema}.{child}", f"{parent_schema}.{parent}", tuple(child_cols), tuple(parent_cols)
+        )
         if child_schema == schema:
             outgoing[child].append(fk)
         if parent_schema == schema:

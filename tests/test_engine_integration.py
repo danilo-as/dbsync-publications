@@ -23,7 +23,9 @@ V2 = "22222222-2222-2222-2222-222222222222"
 
 DDL = """
 CREATE SCHEMA locations;
-CREATE TABLE locations.regions (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE locations.countries (id int PRIMARY KEY, code text NOT NULL);
+CREATE TABLE locations.regions (
+    id int PRIMARY KEY, name text NOT NULL, country_id int REFERENCES locations.countries(id));
 CREATE SCHEMA demo_publications;
 CREATE TABLE demo_publications.publication_versions (
     id uuid PRIMARY KEY, publication_year int NOT NULL, publication_quarter int NOT NULL,
@@ -37,7 +39,8 @@ CREATE TABLE demo_publications.system_pricing (
 """
 
 SOURCE_DATA = f"""
-INSERT INTO locations.regions VALUES (1, 'North'), (2, 'South');
+INSERT INTO locations.countries VALUES (1, 'AR'), (2, 'CL');
+INSERT INTO locations.regions VALUES (1, 'North', 1), (2, 'South', 1), (3, 'East', 2);
 INSERT INTO demo_publications.publication_versions VALUES
     ('{V1}', 2026, 2, 1, false), ('{V2}', 2026, 3, 1, true);
 INSERT INTO demo_publications.prices (version_id, value) VALUES
@@ -104,12 +107,18 @@ def test_publication_sync_replaces_selected_versions_and_skips_drifted_table(dat
     assert _rows(t1, "SELECT id::text, latest FROM demo_publications.publication_versions") == [(V1, False)]
     # Table without version_id is truncated and fully reloaded.
     assert _rows(t1, "SELECT id, value FROM demo_publications.system_pricing ORDER BY id") == [(1, 5.5), (2, 6.5)]
-    assert results["target_1"].tables == {"prices": 2, "system_pricing": 2}
+    # Regions already exist; the country they reference in source is added (insert only).
+    assert results["target_1"].tables == {
+        "locations.countries (parent rows)": 1, "locations.regions (parent rows)": 0,
+        "prices": 2, "system_pricing": 2,
+    }
 
     # Target 2: drifted prices untouched, system_pricing still synced.
     assert _rows(t2, "SELECT value FROM demo_publications.prices") == [(99,)]
     assert _rows(t2, "SELECT id FROM demo_publications.system_pricing ORDER BY id") == [(1,), (2,)]
-    assert results["target_2"].tables == {"system_pricing": 2}
+    assert results["target_2"].tables == {
+        "locations.countries (parent rows)": 1, "locations.regions (parent rows)": 0, "system_pricing": 2,
+    }
 
 
 def test_other_schema_inserts_only_new_rows(databases):
@@ -124,9 +133,12 @@ def test_other_schema_inserts_only_new_rows(databases):
     results = execute_plan(source, {"target_1": t1}, plan)
 
     assert results[0].ok
-    assert results[0].tables == {"regions": 1}
-    # Existing row is kept as-is; only the new one is added.
-    assert _rows(t1, "SELECT id, name FROM locations.regions ORDER BY id") == [(1, "Norte"), (2, "South")]
+    assert results[0].tables == {"locations.countries (parent rows)": 2, "regions": 2}
+    # Existing row is kept as-is; only the new ones are added, after their countries.
+    assert _rows(t1, "SELECT id, name FROM locations.regions ORDER BY id") == [
+        (1, "Norte"), (2, "South"), (3, "East")
+    ]
+    assert _rows(t1, "SELECT id FROM locations.countries ORDER BY id") == [(1,), (2,)]
 
 
 def test_version_table_is_never_truncated_without_versions(databases):
@@ -145,15 +157,61 @@ def test_version_table_is_never_truncated_without_versions(databases):
     results = execute_plan(source, {"target_1": t1}, plan)
 
     assert results[0].ok
-    assert results[0].tables == {"system_pricing": 2}
+    assert results[0].tables == {
+        "locations.countries (parent rows)": 1, "locations.regions (parent rows)": 0, "system_pricing": 2,
+    }
     assert _rows(t1, "SELECT value FROM demo_publications.prices") == [(99,)]
+
+
+def test_missing_parent_rows_are_copied_and_existing_ones_kept(databases):
+    source, targets = databases
+    t1 = targets["target_1"]
+    # Region 1 exists with another name; region 2 and both countries are missing.
+    t1.execute("INSERT INTO locations.regions VALUES (1, 'Norte')")
+
+    plan = build_plan(
+        source, {"target_1": t1}, schema="demo_publications",
+        table_names=["system_pricing"], version_ids=[], publication_mode=True,
+    )
+    notes = plan.targets["target_1"][0].messages
+    assert "missing parent rows in locations.regions are copied from source (ON CONFLICT DO NOTHING)" in notes
+    results = execute_plan(source, {"target_1": t1}, plan)
+
+    assert results[0].ok, results
+    # Only referenced parents: region 3 (East) and country 2 (CL) are never copied.
+    assert _rows(t1, "SELECT id, name, country_id FROM locations.regions ORDER BY id") == [
+        (1, "Norte", None), (2, "South", 1)
+    ]
+    assert _rows(t1, "SELECT id, code FROM locations.countries") == [(1, "AR")]
+    assert results[0].tables == {
+        "locations.countries (parent rows)": 1, "locations.regions (parent rows)": 1, "system_pricing": 2,
+    }
+
+
+def test_parent_table_differing_in_target_skips_child(databases):
+    source, targets = databases
+    t1 = targets["target_1"]
+    t1.execute("ALTER TABLE locations.countries ADD COLUMN extra text")
+
+    plan = build_plan(
+        source, {"target_1": t1}, schema="demo_publications",
+        table_names=["system_pricing"], version_ids=[], publication_mode=True,
+    )
+    pricing = plan.targets["target_1"][0]
+    assert not pricing.ready
+    assert "parent table locations.countries differs in target (column extra: exists only in target)" in (
+        pricing.messages
+    )
+    execute_plan(source, {"target_1": t1}, plan)
+    assert _rows(t1, "SELECT count(*) FROM locations.regions") == [(0,)]
 
 
 def test_failure_rolls_back_whole_target(databases):
     source, targets = databases
     t1 = targets["target_1"]
-    # Parent rows missing: system_pricing COPY violates its FK to locations.regions.
+    # system_pricing COPY violates a CHECK that only exists in the target.
     t1.execute(f"""
+        ALTER TABLE demo_publications.system_pricing ADD CONSTRAINT small_value CHECK (value < 6);
         INSERT INTO demo_publications.publication_versions VALUES ('{V1}', 2026, 2, 1, true);
         INSERT INTO demo_publications.prices (version_id, value) VALUES ('{V1}', 99);
     """)
@@ -165,6 +223,8 @@ def test_failure_rolls_back_whole_target(databases):
     results = execute_plan(source, {"target_1": t1}, plan)
 
     assert not results[0].ok
-    assert "foreign key" in results[0].error
+    assert "small_value" in results[0].error
     assert _rows(t1, "SELECT value FROM demo_publications.prices") == [(99,)]
     assert _rows(t1, "SELECT latest FROM demo_publications.publication_versions") == [(True,)]
+    # Parent rows inserted earlier in the same transaction are rolled back too.
+    assert _rows(t1, "SELECT count(*) FROM locations.regions") == [(0,)]
