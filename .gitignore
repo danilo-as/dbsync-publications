@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 dist/
+
+# IDE and agent tooling
+.idea/
+.atl/
