@@ -33,8 +33,8 @@ The CLI asks, in order:
 2. **Schema**: one schema per run.
 3. **Publication versions** (publication schemas only): one or more rows of
    `<schema>.publication_versions`. `publication_month` is shown when the schema has it.
-4. **Tables**: multi-select. Views are not listed. `publication_versions` is synced
-   automatically and is not listed.
+4. **Tables**: multi-select. The first entry, `★ All tables`, selects every listed table at
+   once. Views are not listed. `publication_versions` is synced automatically and is not listed.
 
 It then validates every target, shows a plan per target and asks for confirmation.
 

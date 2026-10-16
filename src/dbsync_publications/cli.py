@@ -21,6 +21,7 @@ console = Console()
 
 PUBLICATION_GROUP = "Publication schemas (*publications)"
 OTHER_GROUP = "Other schemas"
+ALL_TABLES = "__all_tables__"
 
 
 class Aborted(Exception):
@@ -68,6 +69,13 @@ def choose_versions(source: psycopg.Connection, schema: str, tables: dict) -> li
     )
 
 
+def resolve_tables(selected: list[str], names: list[str]) -> list[str]:
+    """Expand the "all tables" choice to every listed table."""
+    if ALL_TABLES in selected:
+        return list(names)
+    return [name for name in selected if name != ALL_TABLES]
+
+
 def choose_tables(tables: dict, publication_mode: bool, versions_available: bool) -> list[str]:
     choices = []
     for name, table in sorted(tables.items()):
@@ -86,13 +94,16 @@ def choose_tables(tables: dict, publication_mode: bool, versions_available: bool
     if not choices:
         console.print("[red]The schema has no tables to sync.[/red]")
         raise Aborted
-    return ask(
+    names = [c.value for c in choices]
+    all_choice = questionary.Choice(f"★ All tables ({len(names)})", value=ALL_TABLES)
+    selected = ask(
         questionary.checkbox(
             "Tables to sync:",
-            choices=choices,
+            choices=[all_choice, questionary.Separator(), *choices],
             validate=lambda selected: bool(selected) or "Select at least one table",
         )
     )
+    return resolve_tables(selected, names)
 
 
 def show_plan(plan: SyncPlan, target_labels: dict[str, str]) -> bool:
