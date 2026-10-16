@@ -1,0 +1,27 @@
+[project]
+name = "dbsync-publications"
+version = "0.1.0"
+description = "Interactive CLI to sync PostgreSQL publication data between databases"
+readme = "README.md"
+authors = [
+    { name = "Danilo Cadena", email = "danilo.cadena@allansolutions.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.2.4",
+    "questionary>=2.1.1",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+dbsync-publications = "dbsync_publications:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
