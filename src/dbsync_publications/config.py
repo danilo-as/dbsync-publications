@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 from psycopg.conninfo import conninfo_to_dict
 
 SOURCE_VAR = "SOURCE_DATABASE_URL"
 TARGET_VARS = ("TARGET_1_DATABASE_URL", "TARGET_2_DATABASE_URL")
+MIGRATIONS_VAR = "MIGRATIONS_DIR"
 
 
 class ConfigError(Exception):
@@ -20,6 +22,7 @@ class ConfigError(Exception):
 class Settings:
     source_url: str
     target_urls: dict[str, str]  # env var name -> url, only defined targets
+    migrations_dir: Path | None = None  # bmi-data-warehouse-sql migrations/, optional
 
 
 def load_settings(env_file: str | None = None) -> Settings:
@@ -32,7 +35,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         raise ConfigError(f"Define at least one target: {', '.join(TARGET_VARS)}")
     if source in targets.values():
         raise ConfigError("A target URL is identical to the source URL")
-    return Settings(source, targets)
+    migrations = os.environ.get(MIGRATIONS_VAR, "").strip()
+    return Settings(source, targets, Path(migrations).expanduser() if migrations else None)
 
 
 def describe(url: str) -> str:

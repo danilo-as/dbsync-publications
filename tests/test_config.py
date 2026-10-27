@@ -7,7 +7,7 @@ SRC = "postgresql://u:secret@src-host:5432/warehouse"
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for var in ("SOURCE_DATABASE_URL", "TARGET_1_DATABASE_URL", "TARGET_2_DATABASE_URL"):
+    for var in ("SOURCE_DATABASE_URL", "TARGET_1_DATABASE_URL", "TARGET_2_DATABASE_URL", "MIGRATIONS_DIR"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -48,3 +48,16 @@ def test_invalid_configuration(tmp_path, content, message):
 
 def test_describe_hides_credentials():
     assert describe(SRC) == "src-host:5432/warehouse"
+
+
+def test_migrations_dir_is_optional(tmp_path):
+    env = write_env(tmp_path, f"SOURCE_DATABASE_URL={SRC}\nTARGET_1_DATABASE_URL=postgresql://u:p@t1/db\n")
+    assert load_settings(env).migrations_dir is None
+
+
+def test_migrations_dir_is_read(tmp_path):
+    env = write_env(
+        tmp_path,
+        f"SOURCE_DATABASE_URL={SRC}\nTARGET_1_DATABASE_URL=postgresql://u:p@t1/db\nMIGRATIONS_DIR={tmp_path}\n",
+    )
+    assert load_settings(env).migrations_dir == tmp_path

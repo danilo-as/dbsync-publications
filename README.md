@@ -16,6 +16,8 @@ SOURCE_DATABASE_URL=postgresql://user:password@source-host:5432/warehouse
 TARGET_1_DATABASE_URL=postgresql://user:password@target-host:5432/warehouse
 # Optional second target
 TARGET_2_DATABASE_URL=postgresql://user:password@other-host:5432/warehouse
+# Optional: bmi-data-warehouse-sql migrations directory for the Flyway check
+MIGRATIONS_DIR=/path/to/bmi-data-warehouse-sql/migrations
 ```
 
 Every target defined in `.env` is synced on each run.
@@ -27,7 +29,31 @@ uv run dbsync-publications            # reads ./.env
 uv run dbsync-publications --env-file /path/to/.env
 ```
 
-The CLI asks, in order:
+### Flyway migration check
+
+When `MIGRATIONS_DIR` is set, the CLI starts by comparing `flyway.flyway_schema_history` on the
+source and on each target with the `V<version>__<description>.sql` files of that directory:
+
+- The source history is the reference. A migration is **missing** on a target when the source
+  applied it successfully and the target has not (versions covered by a `BASELINE` row count as
+  applied). Failed rows (`success = false`) and source migrations whose file is not in the
+  directory (update the repository) are reported too. Files the source has not applied yet are
+  only listed; they are never run.
+- Missing migrations can be run **only on local targets** (`localhost`, `127.0.0.1`, `::1` or a
+  Unix socket), after a confirmation. They run as the connected user (an admin locally), without
+  `SET ROLE`. Each migration runs in one transaction together with its history row; a migration
+  with `CONCURRENTLY` runs statement by statement outside a transaction, as Flyway does. The
+  history row is copied from the source, so `version`, `description`, `type`, `script` and
+  `checksum` are identical; `installed_rank`, `installed_by`, `installed_on` and
+  `execution_time` describe the local run. A failed row of the same version is replaced. The
+  first failure stops the remaining migrations of that target.
+- A local target without a history table can get one by copying the whole source history as-is,
+  after a confirmation. Only accept it when that database already matches the source.
+- Remote targets are only reported: there migrations belong to the deploy pipeline.
+- Reading the history needs `USAGE` on schema `flyway` and `SELECT` on the table. If the source
+  history cannot be read, the CLI says so and nothing can be run.
+
+The CLI then asks, in order:
 
 1. **Schema group**: publication schemas (name ends with `publications`) or other schemas.
 2. **Schema**: one schema per run.

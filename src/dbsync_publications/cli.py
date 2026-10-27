@@ -11,8 +11,8 @@ import questionary
 from rich.console import Console
 from rich.table import Table
 
-from . import catalog
-from .config import ConfigError, describe, load_settings
+from . import catalog, migrations
+from .config import ConfigError, Settings, describe, load_settings
 from .engine import SyncPlan, build_plan, execute_plan
 from .models import VERSIONS_TABLE, Strategy
 from .planner import split_schemas, strategy_for, table_notices
@@ -127,6 +127,104 @@ def show_plan(plan: SyncPlan, target_labels: dict[str, str]) -> bool:
     return any_ready
 
 
+def _versions(values: list[str]) -> str:
+    return ", ".join(f"V{v}" for v in values)
+
+
+def _read_history(conn: psycopg.Connection, label: str) -> tuple[bool, list | None]:
+    """Return (readable, rows); rows is None when the history table does not exist."""
+    try:
+        return True, migrations.read_history(conn)
+    except psycopg.Error as exc:
+        console.print(f"[yellow]⚠ {label}: cannot read flyway history ({str(exc).strip().splitlines()[0]})[/yellow]")
+        return False, None
+
+
+def check_migrations(settings: Settings, source: psycopg.Connection, targets: dict[str, psycopg.Connection]) -> None:
+    """Report Flyway migrations missing on each target; offer to run them on local targets only."""
+    directory = settings.migrations_dir
+    if directory is None:
+        console.print(f"[dim]{migrations.HISTORY_TABLE} check skipped: MIGRATIONS_DIR is not set.[/dim]")
+        return
+    if not directory.is_dir():
+        console.print(f"[yellow]⚠ MIGRATIONS_DIR {directory} is not a directory: migration check skipped.[/yellow]")
+        return
+    console.rule("Flyway migrations")
+    repo = migrations.load_repo(directory)
+
+    source_ok, source_rows = _read_history(source, "Source")
+    if source_ok and source_rows is None:
+        console.print("[yellow]⚠ Source has no flyway history table.[/yellow]")
+    elif source_rows is not None:
+        status = migrations.migration_status(repo, source_rows, None)
+        applied = [r.version for r in source_rows if r.success and r.version]
+        latest = f"latest V{max(applied, key=migrations.version_key)}" if applied else "no successful versions"
+        console.print(f"Source: {len(source_rows)} history rows, {latest}.")
+        if status.not_in_source:
+            console.print(f"[dim]Not applied in source yet (never run here): {_versions(status.not_in_source)}[/dim]")
+    if source_rows is None:
+        console.print("[yellow]Without the source history no migration can be run, only reported.[/yellow]")
+
+    for name, conn in targets.items():
+        local = migrations.is_local(settings.target_urls[name])
+        readable, rows = _read_history(conn, name)
+        if not readable:
+            continue
+        if rows is None:
+            console.print(f"[yellow]⚠ {name}: no flyway history table.[/yellow]")
+            if not (local and source_rows):
+                continue
+            if not ask(
+                questionary.confirm(
+                    f"Create the history on {name} by copying the {len(source_rows)} source rows as-is? "
+                    "Only correct if this database already matches the source.",
+                    default=False,
+                )
+            ):
+                continue
+            try:
+                migrations.bootstrap_history(conn, source_rows)
+                rows = migrations.read_history(conn)
+            except psycopg.Error as exc:
+                console.print(f"[red]✘ {name}: history copy failed and was rolled back:[/red] {str(exc).strip()}")
+                continue
+            console.print(f"[green]✔ {name}: history copied from source.[/green]")
+
+        status = migrations.migration_status(repo, source_rows, rows)
+        if status.failed:
+            failed = _versions([r.version or "" for r in status.failed])
+            console.print(f"[red]✘ {name}: failed migrations in history: {failed}[/red]")
+        if status.missing_files:
+            console.print(
+                f"[yellow]⚠ {name}: applied in source but missing in {directory} "
+                f"(update the repository): {_versions(status.missing_files)}[/yellow]"
+            )
+        if source_rows is None:
+            if status.repo_pending:
+                pending = _versions(status.repo_pending)
+                console.print(f"[yellow]⚠ {name}: not applied (per repository): {pending}[/yellow]")
+            continue
+        if not status.runnable:
+            console.print(f"[green]✔ {name}: up to date with the source.[/green]")
+            continue
+        console.print(f"[yellow]⚠ {name}: {len(status.runnable)} migrations applied in source are missing:[/yellow]")
+        for row in status.runnable:
+            console.print(f"   {row.script}")
+        if not local:
+            console.print(f"   [dim]{name} is not local: migrations are only run on localhost targets.[/dim]")
+            continue
+        if not ask(questionary.confirm(f"Run them on {name}?", default=False)):
+            continue
+        for row in status.runnable:
+            migration = repo[row.version]
+            try:
+                elapsed = migrations.apply_migration(conn, migration, row)
+            except psycopg.Error as exc:
+                console.print(f"[red]✘ {migration.script} failed, later migrations not run:[/red] {str(exc).strip()}")
+                break
+            console.print(f"[green]✔ {migration.script}[/green] ({elapsed} ms)")
+
+
 def run(env_file: str | None) -> int:
     try:
         settings = load_settings(env_file)
@@ -151,6 +249,7 @@ def run(env_file: str | None) -> int:
             return 2
 
         try:
+            check_migrations(settings, source, targets)
             schema, publication_mode = choose_schema(source)
             tables = catalog.load_tables(source, schema)
             version_ids = choose_versions(source, schema, tables) if publication_mode else []
