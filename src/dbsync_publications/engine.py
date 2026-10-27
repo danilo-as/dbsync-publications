@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import tempfile
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,10 +14,13 @@ import psycopg
 from psycopg import sql
 
 from . import catalog
-from .models import VERSION_COLUMN, VERSIONS_TABLE, ParentFill, Strategy, TableInfo, TablePlan
+from .models import VERSION_COLUMN, VERSIONS_TABLE, ParentEdge, ParentFill, Strategy, TableInfo, TablePlan
 from .planner import parent_closure, plan_target, strategy_for, topo_order
 
 CHUNK_SIZE = 1024 * 1024
+# NULL as \N (never quoted) so the CSV keeps NULL apart from the empty string ("").
+CSV_NULL = "\\N"
+CSV_OPTIONS = sql.SQL("FORMAT csv, HEADER, NULL {}").format(sql.Literal(CSV_NULL))
 
 
 @dataclass
@@ -33,6 +40,31 @@ class TargetResult:
     ok: bool
     error: str | None = None
     tables: dict[str, int] = field(default_factory=dict)
+
+
+class Progress:
+    """Receives the start and end of every sync step. The default reports nothing."""
+
+    def start(self, label: str) -> None:
+        pass
+
+    def done(self, label: str, detail: str) -> None:
+        pass
+
+
+@dataclass
+class _StepRows:
+    count: int | None = None
+
+
+@contextmanager
+def _step(progress: Progress, label: str) -> Iterator[_StepRows]:
+    progress.start(label)
+    began = time.monotonic()
+    rows = _StepRows()
+    yield rows
+    elapsed = f"{time.monotonic() - began:.1f}s"
+    progress.done(label, elapsed if rows.count is None else f"{rows.count} rows, {elapsed}")
 
 
 class _CatalogCache:
@@ -92,8 +124,10 @@ def execute_plan(
     source: psycopg.Connection,
     targets: dict[str, psycopg.Connection],
     plan: SyncPlan,
+    progress: Progress | None = None,
 ) -> list[TargetResult]:
     """Export every ready table once, then load each target in its own transaction."""
+    progress = progress or Progress()
     ready_tables = {p.table.name: p.table for plans in plan.targets.values() for p in plans if p.ready}
     needs_versions = any(
         p.ready and p.strategy is Strategy.VERSION_REPLACE for plans in plan.targets.values() for p in plans
@@ -103,19 +137,25 @@ def execute_plan(
         tmp_dir = Path(tmp)
         files: dict[str, Path] = {}
         exported: dict[str, int] = {}
-        filters: dict[str, sql.Composed | None] = {}
         for name, table in ready_tables.items():
             strategy = next(p.strategy for plans in plan.targets.values() for p in plans if p.table.name == name)
             where = _version_filter(table, plan.version_ids) if strategy is Strategy.VERSION_REPLACE else None
-            filters[table.qualified] = where
-            files[name], exported[name] = _export(source, table, where, tmp_dir)
+            with _step(progress, f"Export {table.qualified}") as rows:
+                files[name], exported[name] = _export(source, table, where, tmp_dir)
+                rows.count = exported[name]
         needed = {parent for plans in plan.targets.values() for p in plans if p.ready for parent in p.parents}
-        parent_filter = _ParentFilter(plan.parents, filters, needed)
-        for parent in sorted(needed):
-            files[parent], _ = _export(source, plan.parents[parent].table, parent_filter.of(parent), tmp_dir)
+        exported_files = {ready_tables[name].qualified: path for name, path in files.items()}
+        parent_keys = _ParentKeys(plan.parents, needed, exported_files)
+        # Children before parents, so every parent's keys come from files already exported.
+        for parent in reversed(topo_order([plan.parents[name].table for name in needed])):
+            with _step(progress, f"Export parent rows of {parent.qualified}") as rows:
+                where = parent_keys.filter(parent.qualified)
+                files[parent.qualified], rows.count = _export(source, parent, where, tmp_dir)
+                exported_files[parent.qualified] = files[parent.qualified]
         if needs_versions and plan.versions_table is not None:
             pv = plan.versions_table
-            files[VERSIONS_TABLE], _ = _export(source, pv, _id_filter(pv, plan.version_ids), tmp_dir)
+            with _step(progress, f"Export {pv.qualified}") as rows:
+                files[VERSIONS_TABLE], rows.count = _export(source, pv, _id_filter(pv, plan.version_ids), tmp_dir)
 
         results = []
         for name, conn in targets.items():
@@ -124,11 +164,25 @@ def execute_plan(
                 results.append(TargetResult(name, ok=True))
                 continue
             try:
-                counts = _load_target(conn, plan, ready, files, exported)
+                counts = _load_target(conn, plan, ready, files, exported, _TargetProgress(progress, name))
                 results.append(TargetResult(name, ok=True, tables=counts))
             except psycopg.Error as exc:
                 results.append(TargetResult(name, ok=False, error=str(exc).strip()))
         return results
+
+
+class _TargetProgress(Progress):
+    """Prefix every step label with the target name."""
+
+    def __init__(self, inner: Progress, target: str):
+        self._inner = inner
+        self._target = target
+
+    def start(self, label: str) -> None:
+        self._inner.start(f"{self._target}: {label}")
+
+    def done(self, label: str, detail: str) -> None:
+        self._inner.done(f"{self._target}: {label}", detail)
 
 
 def _qualified(table: TableInfo) -> sql.Composed:
@@ -156,55 +210,77 @@ def _id_filter(pv: TableInfo, version_ids: list[str]) -> sql.Composed:
     return sql.SQL("{} = ANY({})").format(sql.Identifier("id"), _array_of(version_ids, id_type))
 
 
-class _ParentFilter:
-    """Build the WHERE clause that selects only the parent rows the synced rows reference.
+def referenced_keys(
+    path: Path, column_groups: Iterable[tuple[str, ...]]
+) -> dict[tuple[str, ...], set[tuple[str, ...]]]:
+    """Read the distinct non-NULL values of each column group from a CSV written by ``_export``.
 
-    A parent row is needed when an exported child row (a synced table, or another
-    needed parent) points at it. Self-referencing parents are copied whole, because
-    their own ancestors would otherwise be missing.
+    NULL is written unquoted as ``CSV_NULL``. A text value equal to it is written quoted, but the
+    csv module drops quotes, so such a key reads as NULL: its parent row is not copied and the
+    load then fails on the foreign key instead of silently skipping data.
+    """
+    groups = list(dict.fromkeys(column_groups))
+    keys: dict[tuple[str, ...], set[tuple[str, ...]]] = {group: set() for group in groups}
+    with path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        positions = {group: [header.index(c) for c in group] for group in groups}
+        for row in reader:
+            for group, indexes in positions.items():
+                key = tuple(row[i] for i in indexes)
+                if CSV_NULL not in key:
+                    keys[group].add(key)
+    return keys
+
+
+class _ParentKeys:
+    """Build the WHERE clause that selects only the parent rows the exported rows reference.
+
+    The referenced keys are read from the CSV files already exported (synced tables and
+    needed parents), so the source never re-scans a large child table per foreign key.
+    Each child file is read once, for every foreign key it holds toward a needed parent.
+    Self-referencing parents are copied whole, because their own ancestors would otherwise
+    be missing.
     """
 
-    def __init__(
-        self,
-        parents: dict[str, ParentFill],
-        child_filters: dict[str, sql.Composed | None],
-        needed: set[str],
-    ):
+    def __init__(self, parents: dict[str, ParentFill], needed: set[str], files: dict[str, Path]):
         self._parents = parents
-        self._child_filters = child_filters
         self._needed = needed
-        self._memo: dict[str, sql.Composable | None] = {}
+        self._files = files  # qualified table -> exported CSV, filled as parents get exported
+        self._keys: dict[tuple[str, tuple[str, ...]], set[tuple[str, ...]]] = {}
 
-    def of(self, name: str, path: frozenset[str] = frozenset()) -> sql.Composable | None:
-        if name in self._memo:
-            return self._memo[name]
+    def filter(self, name: str) -> sql.Composable | None:
         fill = self._parents[name]
         if fill.self_referencing:
             return None
-        parts: list[sql.Composable] = []
+        by_columns: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
         for edge in fill.edges:
-            child = edge.child
-            if child in path:  # cycle between parent tables
+            # Skips unselected children and, in a cycle between parents, a child not exported yet.
+            if edge.child not in self._files:
                 continue
-            if child in self._child_filters:
-                where = self._child_filters[child]
-            elif child in self._needed:
-                where = self.of(child, path | {name})
-            else:
-                continue
-            subquery = sql.SQL("SELECT {} FROM {}").format(
-                sql.SQL(", ").join(sql.Identifier(c) for c in edge.fk.columns), _qualified_name(child)
-            )
-            if where is not None:
-                subquery += sql.SQL(" WHERE ") + where
-            parts.append(
-                sql.SQL("({}) IN ({})").format(
-                    sql.SQL(", ").join(sql.Identifier(c) for c in edge.fk.referenced_columns), subquery
-                )
-            )
-        result = sql.SQL(" OR ").join(parts) if parts else sql.SQL("FALSE")
-        self._memo[name] = result
-        return result
+            by_columns.setdefault(edge.fk.referenced_columns, set()).update(self._keys_of(edge))
+        types = {c.name: c.data_type for c in fill.table.columns}
+        parts = [_key_filter(columns, keys, types) for columns, keys in by_columns.items() if keys]
+        return sql.SQL(" OR ").join(parts) if parts else sql.SQL("FALSE")
+
+    def _keys_of(self, edge: ParentEdge) -> set[tuple[str, ...]]:
+        if (edge.child, edge.fk.columns) not in self._keys:
+            groups = [
+                e.fk.columns for parent in self._needed for e in self._parents[parent].edges if e.child == edge.child
+            ]
+            for columns, keys in referenced_keys(self._files[edge.child], groups).items():
+                self._keys[(edge.child, columns)] = keys
+        return self._keys[(edge.child, edge.fk.columns)]
+
+
+def _key_filter(columns: tuple[str, ...], keys: set[tuple[str, ...]], types: dict[str, str]) -> sql.Composed:
+    ordered = sorted(keys)
+    arrays = [_array_of([key[i] for key in ordered], types[c]) for i, c in enumerate(columns)]
+    if len(columns) == 1:
+        return sql.SQL("{} = ANY({})").format(sql.Identifier(columns[0]), arrays[0])
+    return sql.SQL("({}) IN (SELECT * FROM unnest({}))").format(
+        sql.SQL(", ").join(sql.Identifier(c) for c in columns), sql.SQL(", ").join(arrays)
+    )
 
 
 def _qualified_name(qualified: str) -> sql.Composed:
@@ -217,7 +293,7 @@ def _export(source: psycopg.Connection, table: TableInfo, where: sql.Composed | 
     select = sql.SQL("SELECT {} FROM {}").format(_column_list(table), _qualified(table))
     if where is not None:
         select += sql.SQL(" WHERE ") + where
-    query = sql.SQL("COPY ({}) TO STDOUT WITH (FORMAT csv, HEADER)").format(select)
+    query = sql.SQL("COPY ({}) TO STDOUT WITH ({})").format(select, CSV_OPTIONS)
     with source.cursor() as cur, path.open("wb") as fh:
         with cur.copy(query) as copy:
             for chunk in copy:
@@ -227,7 +303,7 @@ def _export(source: psycopg.Connection, table: TableInfo, where: sql.Composed | 
 
 
 def _copy_in(cur: psycopg.Cursor, target: sql.Composable, columns: sql.Composable, path: Path) -> None:
-    query = sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT csv, HEADER)").format(target, columns)
+    query = sql.SQL("COPY {} ({}) FROM STDIN WITH ({})").format(target, columns, CSV_OPTIONS)
     with cur.copy(query) as copy, path.open("rb") as fh:
         while chunk := fh.read(CHUNK_SIZE):
             copy.write(chunk)
@@ -269,6 +345,7 @@ def _load_target(
     ready: list[TablePlan],
     files: dict[str, Path],
     exported: dict[str, int],
+    progress: Progress,
 ) -> dict[str, int]:
     strategies = {p.table.name: p.strategy for p in ready}
     ordered = topo_order([p.table for p in ready])
@@ -276,34 +353,41 @@ def _load_target(
 
     with conn.transaction(), conn.cursor() as cur:
         if Strategy.VERSION_REPLACE in strategies.values() and plan.versions_table is not None:
-            _upsert_versions(cur, plan.versions_table, files[VERSIONS_TABLE])
+            with _step(progress, f"Upsert {plan.versions_table.qualified}"):
+                _upsert_versions(cur, plan.versions_table, files[VERSIONS_TABLE])
 
         # Missing parent rows of unselected tables: insert only, never update or delete.
         needed = {parent for p in ready for parent in p.parents}
         parent_tables = topo_order([plan.parents[name].table for name in needed])
         for index, parent in enumerate(parent_tables):
-            staging = _copy_via_staging(cur, parent, files[parent.qualified], f"p{index}")
-            cur.execute(_insert_from(parent, staging) + sql.SQL(" ON CONFLICT DO NOTHING"))
-            counts[f"{parent.qualified} (parent rows)"] = cur.rowcount
+            with _step(progress, f"Insert missing parent rows into {parent.qualified}") as rows:
+                staging = _copy_via_staging(cur, parent, files[parent.qualified], f"p{index}")
+                cur.execute(_insert_from(parent, staging) + sql.SQL(" ON CONFLICT DO NOTHING"))
+                counts[f"{parent.qualified} (parent rows)"] = rows.count = cur.rowcount
 
         # Children first so deletes/truncates never trip a FK between selected tables.
         for table in reversed(ordered):
             strategy = strategies[table.name]
             if strategy is Strategy.VERSION_REPLACE:
-                cur.execute(
-                    sql.SQL("DELETE FROM {} WHERE ").format(_qualified(table))
-                    + _version_filter(table, plan.version_ids)
-                )
+                with _step(progress, f"Delete selected versions from {table.qualified}") as rows:
+                    cur.execute(
+                        sql.SQL("DELETE FROM {} WHERE ").format(_qualified(table))
+                        + _version_filter(table, plan.version_ids)
+                    )
+                    rows.count = cur.rowcount
             elif strategy is Strategy.TRUNCATE_REPLACE:
-                cur.execute(sql.SQL("TRUNCATE {}").format(_qualified(table)))
+                with _step(progress, f"Truncate {table.qualified}"):
+                    cur.execute(sql.SQL("TRUNCATE {}").format(_qualified(table)))
 
         # Parents first so inserted children always find their referenced rows.
         for index, table in enumerate(ordered, start=1):
-            if strategies[table.name] is Strategy.INSERT_NEW:
-                staging = _copy_via_staging(cur, table, files[table.name], index)
-                cur.execute(_insert_from(table, staging) + sql.SQL(" ON CONFLICT DO NOTHING"))
-                counts[table.name] = cur.rowcount
-            else:
-                _copy_in(cur, _qualified(table), _column_list(table), files[table.name])
-                counts[table.name] = exported[table.name]
+            with _step(progress, f"Load {table.qualified}") as rows:
+                if strategies[table.name] is Strategy.INSERT_NEW:
+                    staging = _copy_via_staging(cur, table, files[table.name], index)
+                    cur.execute(_insert_from(table, staging) + sql.SQL(" ON CONFLICT DO NOTHING"))
+                    counts[table.name] = cur.rowcount
+                else:
+                    _copy_in(cur, _qualified(table), _column_list(table), files[table.name])
+                    counts[table.name] = exported[table.name]
+                rows.count = counts[table.name]
     return counts

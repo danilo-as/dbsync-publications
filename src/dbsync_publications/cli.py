@@ -13,7 +13,7 @@ from rich.table import Table
 
 from . import catalog, migrations
 from .config import ConfigError, Settings, describe, load_settings
-from .engine import SyncPlan, build_plan, execute_plan
+from .engine import Progress, SyncPlan, build_plan, execute_plan
 from .models import VERSIONS_TABLE, Strategy
 from .planner import split_schemas, strategy_for, table_notices
 
@@ -26,6 +26,19 @@ ALL_TABLES = "__all_tables__"
 
 class Aborted(Exception):
     pass
+
+
+class StatusProgress(Progress):
+    """Show the running step in the status spinner and print each finished step with its timing."""
+
+    def __init__(self, status):
+        self._status = status
+
+    def start(self, label: str) -> None:
+        self._status.update(f"{label}...")
+
+    def done(self, label: str, detail: str) -> None:
+        console.print(f"[dim]✔ {label} ({detail})[/dim]")
 
 
 def ask(question: questionary.Question):
@@ -270,8 +283,8 @@ def run(env_file: str | None) -> int:
             console.print("Cancelled.")
             return 130
 
-        with console.status("Syncing..."):
-            results = execute_plan(source, targets, plan)
+        with console.status("Syncing...") as status:
+            results = execute_plan(source, targets, plan, StatusProgress(status))
 
     exit_code = 0
     for result in results:

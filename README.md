@@ -90,12 +90,16 @@ selected tables.
 - Missing parent rows are copied automatically. For every foreign key from a selected table to
   an unselected table (any schema, followed recursively to parents of parents), only the parent
   rows referenced by the synced rows are exported from the source and inserted, parents first,
-  with `INSERT ... ON CONFLICT DO NOTHING`. Existing parent rows are never updated or deleted.
-  The plan lists every parent table that will be filled. A parent table that references itself
-  is copied whole (still insert only). If a parent table differs in the target, or does not
-  exist there, the selected table that needs it is skipped with a message.
+  with `INSERT ... ON CONFLICT DO NOTHING`. The referenced keys are read from the CSV files
+  already exported, so the source never scans a large child table again to find them. Existing
+  parent rows are never updated or deleted. The plan lists every parent table that will be
+  filled. A parent table that references itself is copied whole (still insert only). If a
+  parent table differs in the target, or does not exist there, the selected table that needs
+  it is skipped with a message.
 - In other schemas, tables without a primary key or unique constraint show a warning:
   `ON CONFLICT` cannot detect duplicates there, so every row would be inserted again.
+- While syncing, every step (export, parent rows, delete, load per target) is printed when it
+  finishes, with its row count and duration, and the spinner shows the step in progress.
 - Temporary CSV files live in a temporary directory that is removed at the end of the run,
   including on errors.
 
